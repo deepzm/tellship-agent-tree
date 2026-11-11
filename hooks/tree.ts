@@ -1,6 +1,6 @@
-import type { TurnStepServerToolUse, UiOpenResult } from 'claude-code'
+import type { TurnStepServerToolUse, TurnUsage, UiOpenResult } from 'claude-code'
 
-import type { AgentNode, AgentStatus, AgentTree, PaneRow, PendingCompletion, Role, Row, Segment } from '../types'
+import type { AgentNode, AgentStatus, AgentTree, PaneRow, PendingCompletion, PendingContext, Role, Row, Segment } from '../types'
 
 export type TreeEvent =
   | { type: 'session.started'; at?: number }
@@ -18,6 +18,7 @@ export type TreeEvent =
     }
   | { type: 'turn.complete'; agentId?: string; reason: string; durationMs?: number }
   | { type: 'turn.stepped'; agentId: string }
+  | { type: 'context.measured'; agentId: string; tokens: number; window: number }
   | { type: 'tool.called'; agentId: string; tool: string; input: Readonly<Record<string, unknown>> }
   | { type: 'advisor.consulted'; id: string; agentId?: string; startedAt: number; endedAt?: number; at: number }
   | { type: 'finished.cleared' }
@@ -36,6 +37,7 @@ type Alphabet = {
   step: string
   advisor: string
   model: string
+  separator: string
   ellipsis: string
   marker: string
   rule: string
@@ -50,6 +52,7 @@ const UNICODE: Alphabet = {
   step: '↳',
   advisor: '♛',
   model: '◆',
+  separator: '·',
   ellipsis: '…',
   marker: '›',
   rule: '─',
@@ -64,6 +67,7 @@ const ASCII: Alphabet = {
   step: '->',
   advisor: '^',
   model: '#',
+  separator: '-',
   ellipsis: '...',
   marker: '>',
   rule: '-',
@@ -172,8 +176,20 @@ const holdCompletion = (tree: AgentTree, completion: PendingCompletion): AgentTr
   pendingCompletions: [...tree.pendingCompletions.filter(p => p.agentId !== completion.agentId), completion],
 })
 
+// Likewise an agent's steps can all come before its spawn, so a reading for an unknown id waits for it.
+const holdContext = (tree: AgentTree, context: PendingContext): AgentTree => ({
+  ...tree,
+  pendingContexts: [...(tree.pendingContexts ?? []).filter(p => p.agentId !== context.agentId), context],
+})
+
+const contextFields = ({ tokens, window }: PendingContext): Pick<AgentNode, 'contextTokens' | 'contextWindow'> => ({
+  contextTokens: tokens,
+  contextWindow: window,
+})
+
 const spawnAgent = (tree: AgentTree, event: Extract<TreeEvent, { type: 'agent.spawned' }>): AgentTree => {
   const held = tree.pendingCompletions.find(p => p.agentId === event.agentId)
+  const heldContext = tree.pendingContexts?.find(p => p.agentId === event.agentId)
   const spawned: AgentTree = {
     ...tree,
     nodes: [
@@ -183,6 +199,7 @@ const spawnAgent = (tree: AgentTree, event: Extract<TreeEvent, { type: 'agent.sp
         parentAgentId: event.parentAgentId,
         subagentType: event.subagentType,
         model: event.model,
+        ...(heldContext === undefined ? {} : contextFields(heldContext)),
         name: event.name,
         description: event.description === undefined ? undefined : maskSecrets(event.description),
         ...storedTask(event.prompt),
@@ -191,6 +208,7 @@ const spawnAgent = (tree: AgentTree, event: Extract<TreeEvent, { type: 'agent.sp
       },
     ],
     pendingCompletions: tree.pendingCompletions.filter(p => p.agentId !== event.agentId),
+    ...(tree.pendingContexts === undefined ? {} : { pendingContexts: tree.pendingContexts.filter(p => p.agentId !== event.agentId) }),
   }
   return held === undefined ? spawned : completeAgent(spawned, held)
 }
@@ -257,6 +275,12 @@ export const applyEvent = (tree: AgentTree, event: TreeEvent): AgentTree => {
       return spawnAgent(tree, event)
     case 'turn.stepped':
       return updateRunning(tree, event.agentId, { currentStep: THINKING })
+    case 'context.measured': {
+      const context = { agentId: event.agentId, tokens: event.tokens, window: event.window }
+      return tree.nodes.some(node => node.agentId === event.agentId)
+        ? updateNode(tree, event.agentId, node => ({ ...node, ...contextFields(context) }))
+        : holdContext(tree, context)
+    }
     case 'tool.called':
       return updateRunning(tree, event.agentId, { currentStep: stepFor(event.tool, event.input) })
     case 'turn.complete': {
@@ -323,6 +347,35 @@ export const shortModel = (model: string): string => {
 
   return `${name} ${major}${minor === undefined ? '' : `.${minor}`}${suffix === undefined ? '' : ` ${suffix}`}`
 }
+
+// The engine reports no window for a subagent's model, only the session's own, so a model is taken to have the session's window when it is
+// the session's model (`[1m]` and a date left out of the comparison) and DEFAULT_WINDOW otherwise.
+export const DEFAULT_WINDOW = 200_000
+
+const modelKey = (model: string): string => shortModel(model.replace(/\[[^\]]*\]$/, ''))
+
+export const windowFor = (agentModel: string, sessionModel: string | undefined, sessionWindow: number): number =>
+  sessionModel !== undefined && modelKey(agentModel) === modelKey(sessionModel) ? sessionWindow : DEFAULT_WINDOW
+
+// The status line's figure: the input side of the response, uncached, cache-written and cache-read together. Not summed over steps.
+export const contextMeasured = (
+  agentId: string,
+  usage: TurnUsage,
+  sessionModel: string | undefined,
+  sessionWindow: number,
+): TreeEvent => ({
+  type: 'context.measured',
+  agentId,
+  tokens: usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens,
+  window: windowFor(usage.model, sessionModel, sessionWindow),
+})
+
+const contextPercent = ({ contextTokens, contextWindow }: AgentNode): number | undefined =>
+  contextTokens === undefined || contextWindow === undefined || contextWindow <= 0
+    ? undefined
+    : Math.round((contextTokens / contextWindow) * 100)
+
+const withCommas = (n: number): string => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
 
 const FLIGHTDECK_AGENT_CAP = 24
 const DEPTH_CAP = 4
@@ -481,9 +534,11 @@ const branchLines = (groups: Siblings, parent: string | undefined, indent: strin
     ...shown.flatMap((node, index) => {
       const isLast = index === shown.length - 1
       const stem = isLast ? alphabet.blank : alphabet.trunk
+      const percent = contextPercent(node)
+      const used = percent === undefined ? '' : ` ${alphabet.separator} ${percent}%`
       const model =
         node.model !== undefined && view.columns >= GLYPH_ONLY_BELOW
-          ? [dimPaneRow(`${lead}${stem} ${alphabet.model} ${shortModel(node.model)}`, view)]
+          ? [dimPaneRow(`${lead}${stem} ${alphabet.model} ${shortModel(node.model)}${used}`, view)]
           : []
       // The cut that kept a long tool input to SUBJECT_LIMIT was stored as …, whichever alphabet draws it.
       const step =
@@ -618,11 +673,13 @@ export const detailRows = (node: AgentNode, parentLabel: string, now: number, co
   const reason = node.reason === undefined ? '' : ` (${node.reason})`
   const elapsed = elapsedMs(node, now)
   const step = node.currentStep?.replaceAll(UNICODE.ellipsis, alphabet.ellipsis)
+  const percent = contextPercent(node)
 
   return [
     ...wrapText(heading, columns).map(line => row(segment('title', line))),
     ...(isNarrow ? [] : field('Kind', node.kind === 'advisor' ? heading : 'subagent')),
     ...(node.model === undefined ? [] : field('Model', node.model)),
+    ...(percent === undefined ? [] : field('Context', `${percent}% (${withCommas(node.contextTokens!)} / ${withCommas(node.contextWindow!)})`)),
     ...field('Status', `${alphabet.glyph[node.status]} ${node.status}${reason}`, node.status),
     ...(elapsed === undefined ? [] : field('Elapsed', formatElapsed(elapsed))),
     ...(step === undefined ? [] : field('Step', step)),
