@@ -170,7 +170,6 @@ export const register: Register = on => {
       await read($, isAscii),
       (await read($, selectedId)) ?? undefined,
       (await read($, summaryOpen)) ?? undefined,
-      await $.session.model(),
     )
     const { Box, Button, Text } = $.ui.resolve(e)
     const drawPiece = (isSelected: boolean) => ({ role, text }: Segment) => (

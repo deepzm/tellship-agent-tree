@@ -35,7 +35,6 @@ type Alphabet = {
   blank: string
   step: string
   advisor: string
-  model: string
   ellipsis: string
   marker: string
   rule: string
@@ -49,7 +48,6 @@ const UNICODE: Alphabet = {
   blank: '  ',
   step: '↳',
   advisor: '♛',
-  model: '◆',
   ellipsis: '…',
   marker: '›',
   rule: '─',
@@ -63,7 +61,6 @@ const ASCII: Alphabet = {
   blank: '   ',
   step: '->',
   advisor: '^',
-  model: '#',
   ellipsis: '...',
   marker: '>',
   rule: '-',
@@ -309,21 +306,6 @@ export const formatElapsed = (ms: number): string => {
   return `${seconds}s`
 }
 
-// `claude-sonnet-5-5`, `claude-haiku-4-5-20251001` and `claude-3-5-sonnet-20241022` read `sonnet 5.5`, `haiku 4.5` and `sonnet 3.5`.
-// Anything else (an alias, a display name, a provider's id) is shown as it came.
-const FAMILY_FIRST = /^(?:claude-)?(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(\[[^\]]*\])?$/
-const VERSION_FIRST = /^(?:claude-)?(\d+)(?:-(\d{1,2}))?-(opus|sonnet|haiku)(?:-\d{8})?(\[[^\]]*\])?$/
-
-export const shortModel = (model: string): string => {
-  const family = FAMILY_FIRST.exec(model)
-  const version = family === null ? VERSION_FIRST.exec(model) : null
-  const [name, major, minor, suffix] =
-    family !== null ? [family[1], family[2], family[3], family[4]] : version !== null ? [version[3], version[1], version[2], version[4]] : []
-  if (name === undefined) return model
-
-  return `${name} ${major}${minor === undefined ? '' : `.${minor}`}${suffix === undefined ? '' : ` ${suffix}`}`
-}
-
 const FLIGHTDECK_AGENT_CAP = 24
 const DEPTH_CAP = 4
 const NARROW_BELOW = 30
@@ -395,14 +377,6 @@ const elapsedMs = (node: AgentNode, now: number): number | undefined =>
 
 const mainLabel = (tree: AgentTree, now: number): string =>
   tree.startedAt === undefined ? 'Main' : `Main ${formatElapsed(now - tree.startedAt)}`
-
-// Main's model follows its time. Under GLYPH_ONLY_BELOW columns there is no room, and the cut keeps the row inside the pane.
-const mainPaneRow = (tree: AgentTree, now: number, columns: number, alphabet: Alphabet, mainModel: string | undefined): PaneRow => {
-  const label = segment('plain', mainLabel(tree, now))
-  if (mainModel === undefined || columns < GLYPH_ONLY_BELOW) return asPaneRow(row(label))
-
-  return asPaneRow(cut(row(label, segment('dim', ` ${alphabet.model} ${shortModel(mainModel)}`)), columns, alphabet.ellipsis))
-}
 
 const titleOf = (node: AgentNode): string => node.name || node.subagentType || 'agent'
 
@@ -481,10 +455,6 @@ const branchLines = (groups: Siblings, parent: string | undefined, indent: strin
     ...shown.flatMap((node, index) => {
       const isLast = index === shown.length - 1
       const stem = isLast ? alphabet.blank : alphabet.trunk
-      const model =
-        node.model !== undefined && view.columns >= GLYPH_ONLY_BELOW
-          ? [dimPaneRow(`${lead}${stem} ${alphabet.model} ${shortModel(node.model)}`, view)]
-          : []
       // The cut that kept a long tool input to SUBJECT_LIMIT was stored as …, whichever alphabet draws it.
       const step =
         node.currentStep !== undefined && view.columns >= GLYPH_ONLY_BELOW
@@ -492,7 +462,6 @@ const branchLines = (groups: Siblings, parent: string | undefined, indent: strin
           : []
       return [
         nodePaneRow(nodeLine(node, `${lead}${isLast ? alphabet.last : alphabet.branch}`, view), node, view),
-        ...model,
         ...step,
         ...branchLines(groups, node.agentId, `${indent}${stem}`, depth + 1, view),
       ]
@@ -501,17 +470,8 @@ const branchLines = (groups: Siblings, parent: string | undefined, indent: strin
 }
 
 // Above Flightdeck's cap, finished subtrees fold into summary rows and the footer says how many agents are still drawn.
-const drawTree = (
-  tree: AgentTree,
-  columns: number,
-  now: number,
-  isAscii: boolean,
-  selection?: Selection,
-  mainModel?: string,
-): PaneRow[] => {
-  const alphabet = isAscii ? ASCII : UNICODE
-  const main = mainPaneRow(tree, now, columns, alphabet, mainModel)
-  if (tree.nodes.length === 0) return [main, asPaneRow(dimRow(EMPTY_HINT))]
+const drawTree = (tree: AgentTree, columns: number, now: number, isAscii: boolean, selection?: Selection): PaneRow[] => {
+  if (tree.nodes.length === 0) return [asPaneRow(row(segment('plain', mainLabel(tree, now)))), asPaneRow(dimRow(EMPTY_HINT))]
 
   const groups = groupByParent(tree.nodes)
   const overflowing = tree.nodes.length > FLIGHTDECK_AGENT_CAP
@@ -521,7 +481,7 @@ const drawTree = (
     columns,
     now,
     folded: new Set(foldedRoots.map(root => root.agentId)),
-    alphabet,
+    alphabet: isAscii ? ASCII : UNICODE,
     gutter: selection !== undefined && columns >= GLYPH_ONLY_BELOW ? GUTTER : 0,
     selectedId: selection?.selectedId,
   }
@@ -531,7 +491,7 @@ const drawTree = (
     : []
   const widenHint = columns < GLYPH_ONLY_BELOW ? [asPaneRow(row()), dimPaneRow(WIDEN_HINT, flush)] : []
 
-  return [main, ...branchLines(groups, undefined, '', 1, view), ...footer, ...widenHint]
+  return [asPaneRow(row(segment('plain', mainLabel(tree, now)))), ...branchLines(groups, undefined, '', 1, view), ...footer, ...widenHint]
 }
 
 export const renderRows = (tree: AgentTree, columns: number, now: number, isAscii = false): Row[] =>
@@ -660,9 +620,8 @@ export const renderPane = (
   isAscii: boolean,
   selectedId: string | undefined,
   openSummaryId?: string,
-  mainModel?: string,
 ): PaneRow[] => {
-  const treeRows = drawTree(tree, columns, now, isAscii, { selectedId }, mainModel)
+  const treeRows = drawTree(tree, columns, now, isAscii, { selectedId })
   if (tree.nodes.length === 0 || columns < GLYPH_ONLY_BELOW) return treeRows
 
   const alphabet = isAscii ? ASCII : UNICODE
