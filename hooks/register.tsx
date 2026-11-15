@@ -10,6 +10,7 @@ import {
   clearOutput,
   closeOutput,
   commandOutput,
+  contextMeasured,
   emptyTree,
   hasRunning,
   isAsciiLocale,
@@ -153,6 +154,14 @@ export const register: Register = on => {
     // The API runs the advisor inside the request and the engine streams it as opaque chunks, so it is known only here, once over.
     const consults = advisorEvents(response.serverToolUses, e.agentId, await $.clock.now())
     if (consults.length > 0) await recordChange($, t => consults.reduce(applyEvent, t))
+
+    // This hook has no catch handler to fall back on, so a failed reading must not reach the response stream.
+    if (e.agentId !== undefined && response.usage !== null) {
+      try {
+        const { context } = await $.session.usage()
+        await record($, contextMeasured(e.agentId, response.usage, await $.session.model(), context.window))
+      } catch {}
+    }
 
     return response
   })
